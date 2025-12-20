@@ -1,40 +1,66 @@
-# evaluate_model.py
-from sklearn.metrics import accuracy_score, f1_score
-from torch.utils.data import DataLoader
-import torch
+"""Model evaluation script."""
+from sklearn.metrics import classification_report
+from transformers import pipeline
+from pyspark.sql import SparkSession
 
-from src.dataset_loader import DatasetLoader
-from src.utils import SentimentDataset, preprocess_text
-from transformers import RobertaTokenizer, RobertaForSequenceClassification
-from src.config import cfg
+from src.config import MODEL_PATH
+from src.utils import prepare_pandas_dataset
 
-def evaluate():
-    df = DatasetLoader().load_silver(limit=2000)
-    df["clean_text"] = df["text"].apply(preprocess_text)
 
-    tok = RobertaTokenizer.from_pretrained(cfg.MODEL_PATH)
-    ds = SentimentDataset(df, tok)
-    dl = DataLoader(ds, batch_size=32)
+def create_spark_session() -> SparkSession:
+    return (
+        SparkSession.builder
+        .appName("sentiment-evaluation")
+        .master("local[*]")
+        .config(
+            "spark.jars.packages",
+            "org.apache.hadoop:hadoop-aws:3.3.4,"
+            "com.amazonaws:aws-java-sdk-bundle:1.12.662"
+        )
+        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+        .config(
+            "spark.hadoop.fs.s3a.aws.credentials.provider",
+            "com.amazonaws.auth.DefaultAWSCredentialsProviderChain"
+        )
+        .getOrCreate()
+    )
 
-    model = RobertaForSequenceClassification.from_pretrained(cfg.MODEL_PATH)
-    model.cuda()
-    model.eval()
 
-    true, pred = [], []
+def evaluate_model(pdf):
+    pdf = prepare_pandas_dataset(pdf)
+    clf = pipeline(
+        "sentiment-analysis",
+        model=MODEL_PATH,
+    )
 
-    with torch.no_grad():
-        for batch in dl:
-            inputs = {k: v.cuda() for k, v in batch.items() if k != "labels"}
-            logits = model(**inputs).logits
-            p = logits.argmax(1).cpu().numpy()
-            pred.extend(p)
-            true.extend(batch["labels"].numpy())
+    preds = clf(
+        pdf["text_clean"].tolist(),
+        batch_size=32,
+        truncation=True,
+    )
 
-    acc = accuracy_score(true, pred)
-    f1 = f1_score(true, pred, average="macro")
+    pdf["prediction"] = [p["label"] for p in preds]
 
-    print("Accuracy:", acc)
-    print("F1:", f1)
+    print(
+        classification_report(
+            pdf["sentiment_label"],
+            pdf["prediction"],
+            digits=3,
+        )
+    )
+
 
 if __name__ == "__main__":
-    evaluate()
+
+    spark = create_spark_session()
+    spark.sparkContext.setLogLevel("ERROR")
+
+    df = spark.read.parquet(
+        "s3a://bigdata-bluesky-sentiment/silver/annotations/sentiment/"
+    )
+
+    pdf = df.sample(fraction=0.2, seed=42).toPandas()
+
+    evaluate_model(pdf)
+
+    spark.stop()

@@ -1,37 +1,38 @@
+"""Utility functions for data preprocessing and text cleaning."""
 import re
-import torch
-from torch.utils.data import Dataset
 
-LABEL_MAP = {"negative": 0, "neutral": 1, "positive": 2}
+import pandas as pd
 
-def preprocess_text(text):
+
+URL_PATTERN = re.compile(r"https?://\S+|www\.\S+")
+MENTION_PATTERN = re.compile(r"@\w+")
+WHITESPACE_PATTERN = re.compile(r"\s+")
+
+
+def clean_text(text: str):
     if not text:
         return ""
+
     text = text.lower()
-    text = re.sub(r"http\S+|www\S+", "", text)
-    text = re.sub(r"[@#]\S+", "", text)
-    text = re.sub(r"[^a-z0-9\s]", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+    text = URL_PATTERN.sub("", text)
+    text = MENTION_PATTERN.sub("", text)
+    text = WHITESPACE_PATTERN.sub(" ", text)
 
-class SentimentDataset(Dataset):
-    def __init__(self, df, tokenizer):
-        self.texts = df["clean_text"].tolist()
-        self.labels = df["label"].map(LABEL_MAP).tolist()
-        self.tokenizer = tokenizer
+    return text.strip()
 
-    def __len__(self):
-        return len(self.texts)
 
-    def __getitem__(self, idx):
-        enc = self.tokenizer(
-            self.texts[idx],
-            max_length=64,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt"
+def prepare_pandas_dataset(pdf):
+    pdf = pdf.copy()
+
+    if "text" in pdf.columns:
+        pdf["text_clean"] = pdf["text"].apply(clean_text)
+    elif "text_clean" in pdf.columns:
+        pdf["text_clean"] = pdf["text_clean"].astype(str).apply(clean_text)
+    else:
+        raise KeyError(
+            "prepare_pandas_dataset expects a 'text' or 'text_clean' column"
         )
-        return {
-            "input_ids": enc["input_ids"].squeeze(),
-            "attention_mask": enc["attention_mask"].squeeze(),
-            "labels": torch.tensor(self.labels[idx])
-        }
+
+    pdf = pdf[pdf["text_clean"].str.len() > 3]
+
+    return pdf
