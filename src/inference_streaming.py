@@ -16,6 +16,7 @@ from src.config import (
     CHECKPOINT_PATH,
     S3_GOLD_1M_PATH,
 )
+from src.opensearch_writer import OpenSearchWriter
 
 kafka_schema = StructType([
     StructField("language", StringType()),
@@ -64,6 +65,8 @@ def run_streaming_inference():
             print("Empty batch")
             return
 
+        os_writer = OpenSearchWriter()
+
         device = "cuda" if torch.cuda.is_available() else "cpu"
         tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
         model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)
@@ -85,13 +88,13 @@ def run_streaming_inference():
                     label_id = logits.argmax(dim=1).item()
                     sentiment = model.config.id2label[label_id]
 
-                yield (r.timestamp, sentiment)
+                yield (r.timestamp, sentiment, r.text, r.language)
 
         scored_df = (
             batch_df
             .rdd
             .mapPartitions(infer_partition)
-            .toDF(["timestamp", "sentiment"])
+            .toDF(["timestamp", "sentiment", "text", "language"])
             .withColumn("event_time", to_timestamp("timestamp"))
             .withColumn(
                 "sentiment_score",
@@ -115,7 +118,41 @@ def run_streaming_inference():
         )
 
         gold_agg.write.mode("append").parquet(S3_GOLD_1M_PATH)
-        print("✅ Written GOLD 1m")
+        print("✅ Written GOLD 1m to S3")
+
+        predictions = scored_df.select(
+            "timestamp", "sentiment", "sentiment_score", "text", "language", "event_time"
+        ).collect()
+
+        if predictions:
+            pred_list = [
+                {
+                    "timestamp": p.timestamp,
+                    "event_time": p.event_time.isoformat() if p.event_time else None,
+                    "text": p.text,
+                    "language": p.language,
+                    "sentiment": p.sentiment,
+                    "sentiment_score": p.sentiment_score,
+                }
+                for p in predictions
+            ]
+            os_writer.write_predictions(pred_list, batch_id)
+
+        metrics = gold_agg.collect()
+        for m in metrics:
+            os_writer.write_aggregated_metrics(
+                {
+                    "window": str(m.window),
+                    "post_count": m.post_count,
+                    "avg_sentiment": m.avg_sentiment,
+                    "positive_count": m.positive_count,
+                    "neutral_count": m.neutral_count,
+                    "negative_count": m.negative_count,
+                },
+                batch_id,
+            )
+
+        os_writer.close()
 
     (
         parsed_df

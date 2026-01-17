@@ -16,3 +16,12 @@ KAFKA_BROKERS = "54.226.214.16:9092"
 KAFKA_TOPIC = "bluesky"
 CHECKPOINT_PATH = "s3a://bigdata-bluesky-sentiment/checkpoints/sentiment_stream_dbg/"
 
+# OpenSearch configuration - zmień na swoje AWS OpenSearch
+OPENSEARCH_HOST = "opensearch-domain-name.region.es.amazonaws.com"
+OPENSEARCH_PORT = 9200
+OPENSEARCH_USER = "user"
+OPENSEARCH_PASSWORD = "password"
+OPENSEARCH_SENTIMENT_INDEX = "sentiment-predictions-gold"
+OPENSEARCH_BATCH_SIZE = 500
+OPENSEARCH_USE_SSL = True
+
