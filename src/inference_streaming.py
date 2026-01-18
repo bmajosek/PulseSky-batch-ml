@@ -1,12 +1,11 @@
-"""Streaming inference pipeline for real-time sentiment analysis."""
+import os
+import torch
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
-    col, from_json, to_timestamp, window,
-    when, count, avg, sum as spark_sum
+    col, from_json, to_timestamp, when,
+    window, count, avg, sum as spark_sum
 )
 from pyspark.sql.types import StructType, StructField, StringType
-
-import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 from src.config import (
@@ -21,19 +20,31 @@ from src.opensearch_writer import OpenSearchWriter
 kafka_schema = StructType([
     StructField("language", StringType()),
     StructField("text", StringType()),
-    StructField("did", StringType()),
     StructField("timestamp", StringType()),
 ])
-
 
 def run_streaming_inference():
 
     spark = (
         SparkSession.builder
-        .appName("sentiment-streaming-1m")
+        .appName("sentiment-streaming")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("ERROR")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model_path = os.path.abspath(MODEL_PATH)
+    print(f" Loading tokenizer from: {model_path}")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+
+    print(f" Loading model from: {model_path}")
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_path, local_files_only=True
+    ).to(device)
+    model.eval()
+
+    os_writer = OpenSearchWriter()
 
     kafka_df = (
         spark.readStream
@@ -59,111 +70,79 @@ def run_streaming_inference():
     )
 
     def write_batch(batch_df, batch_id):
-        print(f"\n🔥 BATCH {batch_id}")
+        print(f"\n BATCH {batch_id}")
 
         if batch_df.isEmpty():
             print("Empty batch")
             return
 
-        os_writer = OpenSearchWriter()
+        rows = batch_df.collect()
+        predictions = []
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-        model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)
-        model.to(device)
-        model.eval()
-
-        def infer_partition(rows):
-            for r in rows:
-                inputs = tokenizer(
-                    r.text,
-                    truncation=True,
-                    padding="max_length",
-                    max_length=128,
-                    return_tensors="pt",
-                )
-                inputs = {k: v.to(device) for k, v in inputs.items()}
-                with torch.no_grad():
-                    logits = model(**inputs).logits
-                    label_id = logits.argmax(dim=1).item()
-                    sentiment = model.config.id2label[label_id]
-
-                yield (r.timestamp, sentiment, r.text, r.language)
-
-        scored_df = (
-            batch_df
-            .rdd
-            .mapPartitions(infer_partition)
-            .toDF(["timestamp", "sentiment", "text", "language"])
-            .withColumn("event_time", to_timestamp("timestamp"))
-            .withColumn(
-                "sentiment_score",
-                when(col("sentiment") == "negative", -1)
-                .when(col("sentiment") == "neutral", 0)
-                .when(col("sentiment") == "positive", 1)
+        for r in rows:
+            inputs = tokenizer(
+                r.text,
+                truncation=True,
+                padding=True,
+                max_length=128,
+                return_tensors="pt"
             )
-        )
+            inputs = {k: v.to(device) for k, v in inputs.items()}
 
-        gold_agg = (
-            scored_df
-            .withWatermark("event_time", "10 minutes")
-            .groupBy(window(col("event_time"), "1 minute"))
-            .agg(
-                count("*").alias("post_count"),
-                avg("sentiment_score").alias("avg_sentiment"),
-                spark_sum(when(col("sentiment") == "positive", 1).otherwise(0)).alias("positive_count"),
-                spark_sum(when(col("sentiment") == "neutral", 1).otherwise(0)).alias("neutral_count"),
-                spark_sum(when(col("sentiment") == "negative", 1).otherwise(0)).alias("negative_count"),
-            )
-        )
+            with torch.no_grad():
+                logits = model(**inputs).logits
+                label_id = logits.argmax(dim=1).item()
+                sentiment = model.config.id2label[label_id]
 
-        gold_agg.write.mode("append").parquet(S3_GOLD_1M_PATH)
-        print("✅ Written GOLD 1m to S3")
+            score = {"negative": -1, "neutral": 0, "positive": 1}[sentiment]
 
-        predictions = scored_df.select(
-            "timestamp", "sentiment", "sentiment_score", "text", "language", "event_time"
-        ).collect()
+            predictions.append({
+                "timestamp": r.timestamp,
+                "text": r.text,
+                "language": r.language,
+                "sentiment": sentiment,
+                "sentiment_score": score,
+            })
 
         if predictions:
-            pred_list = [
-                {
-                    "timestamp": p.timestamp,
-                    "event_time": p.event_time.isoformat() if p.event_time else None,
-                    "text": p.text,
-                    "language": p.language,
-                    "sentiment": p.sentiment,
-                    "sentiment_score": p.sentiment_score,
-                }
-                for p in predictions
-            ]
-            os_writer.write_predictions(pred_list, batch_id)
+            os_writer.write_predictions(predictions, batch_id)
+            print(f"Written {len(predictions)} docs to OpenSearch")
 
-        metrics = gold_agg.collect()
-        for m in metrics:
-            os_writer.write_aggregated_metrics(
-                {
-                    "window": str(m.window),
-                    "post_count": m.post_count,
-                    "avg_sentiment": m.avg_sentiment,
-                    "positive_count": m.positive_count,
-                    "neutral_count": m.neutral_count,
-                    "negative_count": m.negative_count,
-                },
-                batch_id,
+        if predictions:
+            scored_df = spark.createDataFrame(predictions)
+
+            scored_df = (
+                scored_df
+                .withColumn("event_time", to_timestamp(col("timestamp")))
+                # jeśli timestamp bywa nieparsowalny -> event_time będzie null
+                .filter(col("event_time").isNotNull())
             )
 
-        os_writer.close()
+            gold_agg = (
+                scored_df
+                .withWatermark("event_time", "10 minutes")
+                .groupBy(window(col("event_time"), "1 minute"))
+                .agg(
+                    count("*").alias("post_count"),
+                    avg("sentiment_score").alias("avg_sentiment"),
+                    spark_sum(when(col("sentiment") == "positive", 1).otherwise(0)).alias("positive_count"),
+                    spark_sum(when(col("sentiment") == "neutral", 1).otherwise(0)).alias("neutral_count"),
+                    spark_sum(when(col("sentiment") == "negative", 1).otherwise(0)).alias("negative_count"),
+                )
+            )
+
+            gold_agg.write.mode("append").parquet(S3_GOLD_1M_PATH)
+            print(f"Written GOLD 1m to S3: {S3_GOLD_1M_PATH}")
 
     (
         parsed_df
         .writeStream
         .foreachBatch(write_batch)
-        .option("checkpointLocation", CHECKPOINT_PATH + "_1m")
+        .option("checkpointLocation", CHECKPOINT_PATH)
         .trigger(processingTime="10 seconds")
         .start()
         .awaitTermination()
     )
-
 
 if __name__ == "__main__":
     run_streaming_inference()

@@ -1,4 +1,3 @@
-"""Data loader for reading posts from S3 Bronze layer."""
 from pyspark.sql import DataFrame
 from pyspark.sql.functions import col, element_at
 

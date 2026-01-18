@@ -1,4 +1,3 @@
-"""Batch inference pipeline for sentiment annotation."""
 import pandas as pd
 from pyspark.sql import SparkSession
 from transformers import pipeline

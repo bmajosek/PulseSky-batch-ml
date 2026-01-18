@@ -1,4 +1,3 @@
-"""Model wrapper for RoBERTa sentiment classification."""
 import torch
 from transformers import RobertaForSequenceClassification, RobertaTokenizer
 

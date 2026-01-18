@@ -12,7 +12,7 @@ pyspark==3.5.1
 kafka-python>=2.0.0
 
 # Search & Analytics
-opensearchpy>=2.3.0
+opensearch-py>=2.3.0
 
 # AWS
 boto3>=1.20.0

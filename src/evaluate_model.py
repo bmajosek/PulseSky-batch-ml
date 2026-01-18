@@ -1,4 +1,3 @@
-"""Model evaluation script."""
 from sklearn.metrics import classification_report
 from transformers import pipeline
 from pyspark.sql import SparkSession
