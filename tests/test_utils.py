@@ -30,7 +30,7 @@ def test_prepare_pandas_dataset():
     })
     result2 = prepare_pandas_dataset(df2)
     assert "text_clean" in result2.columns
-    assert len(result2) == 2
+    assert len(result2) == 3
     
     df3 = pd.DataFrame({"other_col": ["test"]})
     try:

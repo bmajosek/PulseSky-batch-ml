@@ -21,6 +21,7 @@ def test_batch_inference_runs(mock_spark, mock_loader, mock_pipeline, mock_prepa
         "post_id": ["1", "2"],
         "language": ["en", "en"],
     })
+    pdf["text_clean"] = pdf["text"]
     mock_df.toPandas.return_value = pdf
     mock_prepare.return_value = pdf
     
